@@ -3,8 +3,8 @@
 #include <userver/utest/utest.hpp>
 
 UTEST(SayHelloTo, Basic) {
-  using pg_service_template::SayHelloTo;
-  using pg_service_template::UserType;
+  using ink::SayHelloTo;
+  using ink::UserType;
 
   EXPECT_EQ(SayHelloTo("Developer", UserType::kFirstTime),
             "Hello, Developer!\n");
