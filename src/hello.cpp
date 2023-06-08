@@ -1,76 +1,114 @@
-#include "hello.hpp"
-
-#include <fmt/format.h>
-
 #include <userver/clients/dns/component.hpp>
+#include <userver/testsuite/testsuite_support.hpp>
+
+#include <userver/utest/using_namespace_userver.hpp>
+
+#include <userver/components/component.hpp>
+#include <userver/components/minimal_server_component_list.hpp>
 #include <userver/server/handlers/http_handler_base.hpp>
+#include <userver/utils/daemon_run.hpp>
+
 #include <userver/storages/postgres/cluster.hpp>
 #include <userver/storages/postgres/component.hpp>
-#include <userver/utils/assert.hpp>
+
+#include "hello.hpp"
 
 namespace ink {
 
-namespace {
+KeyValue::KeyValue(const components::ComponentConfig& config,
+                   const components::ComponentContext& context)
+    : HttpHandlerBase(config, context),
+      pg_cluster_(
+          context.FindComponent<components::Postgres>("key-value-database")
+              .GetCluster()) {
+  constexpr auto kCreateTable = R"~(
+      CREATE TABLE IF NOT EXISTS key_value_table (
+        key VARCHAR PRIMARY KEY,
+        value VARCHAR
+      )
+    )~";
 
-class Hello final : public userver::server::handlers::HttpHandlerBase {
- public:
-  static constexpr std::string_view kName = "handler-hello";
-
-  Hello(const userver::components::ComponentConfig& config,
-        const userver::components::ComponentContext& component_context)
-      : HttpHandlerBase(config, component_context),
-        pg_cluster_(
-            component_context
-                .FindComponent<userver::components::Postgres>("postgres-db-1")
-                .GetCluster()) {}
-
-  std::string HandleRequestThrow(
-      const userver::server::http::HttpRequest& request,
-      userver::server::request::RequestContext&) const override {
-    const auto& name = request.GetArg("name");
-
-    auto user_type = UserType::kFirstTime;
-    if (!name.empty()) {
-      auto result = pg_cluster_->Execute(
-          userver::storages::postgres::ClusterHostType::kMaster,
-          "INSERT INTO hello_schema.users(name, count) VALUES($1, 1) "
-          "ON CONFLICT (name) "
-          "DO UPDATE SET count = users.count + 1 "
-          "RETURNING users.count",
-          name);
-
-      if (result.AsSingleRow<int>() > 1) {
-        user_type = UserType::kKnown;
-      }
-    }
-
-    return ink::SayHelloTo(name, user_type);
-  }
-
-  userver::storages::postgres::ClusterPtr pg_cluster_;
-};
-
-}  // namespace
-
-std::string SayHelloTo(std::string_view name, UserType type) {
-  if (name.empty()) {
-    name = "unknown user";
-  }
-
-  switch (type) {
-    case UserType::kFirstTime:
-      return fmt::format("Hello, {}!\n", name);
-    case UserType::kKnown:
-      return fmt::format("Hi again, {}!\n", name);
-  }
-
-  UASSERT(false);
+  using storages::postgres::ClusterHostType;
+  pg_cluster_->Execute(ClusterHostType::kMaster, kCreateTable);
 }
 
-void AppendHello(userver::components::ComponentList& component_list) {
-  component_list.Append<Hello>();
-  component_list.Append<userver::components::Postgres>("postgres-db-1");
-  component_list.Append<userver::clients::dns::Component>();
+std::string KeyValue::HandleRequestThrow(
+    const server::http::HttpRequest& request,
+    server::request::RequestContext&) const {
+  const auto& key = request.GetArg("key");
+  if (key.empty()) {
+    throw server::handlers::ClientError(
+        server::handlers::ExternalBody{"No 'key' query argument"});
+  }
+
+  switch (request.GetMethod()) {
+    case server::http::HttpMethod::kGet:
+      return GetValue(key, request);
+    case server::http::HttpMethod::kPost:
+      return PostValue(key, request);
+    case server::http::HttpMethod::kDelete:
+      return DeleteValue(key);
+    default:
+      throw server::handlers::ClientError(server::handlers::ExternalBody{
+          fmt::format("Unsupported method {}", request.GetMethod())});
+  }
+}
+
+const storages::postgres::Query kSelectValue{
+    "SELECT value FROM key_value_table WHERE key=$1",
+    storages::postgres::Query::Name{"sample_select_value"},
+};
+
+std::string KeyValue::GetValue(std::string_view key,
+                               const server::http::HttpRequest& request) const {
+  storages::postgres::ResultSet res = pg_cluster_->Execute(
+      storages::postgres::ClusterHostType::kSlave, kSelectValue, key);
+  if (res.IsEmpty()) {
+    request.SetResponseStatus(server::http::HttpStatus::kNotFound);
+    return {};
+  }
+
+  return res.AsSingleRow<std::string>();
+}
+
+const storages::postgres::Query kInsertValue{
+    "INSERT INTO key_value_table (key, value) "
+    "VALUES ($1, $2) "
+    "ON CONFLICT DO NOTHING",
+    storages::postgres::Query::Name{"sample_insert_value"},
+};
+
+std::string KeyValue::PostValue(
+    std::string_view key, const server::http::HttpRequest& request) const {
+  const auto& value = request.GetArg("value");
+
+  storages::postgres::Transaction transaction =
+      pg_cluster_->Begin("sample_transaction_insert_key_value",
+                         storages::postgres::ClusterHostType::kMaster, {});
+
+  auto res = transaction.Execute(kInsertValue, key, value);
+  if (res.RowsAffected()) {
+    transaction.Commit();
+    request.SetResponseStatus(server::http::HttpStatus::kCreated);
+    return std::string{value};
+  }
+
+  res = transaction.Execute(kSelectValue, key);
+  transaction.Rollback();
+
+  auto result = res.AsSingleRow<std::string>();
+  if (result != value) {
+    request.SetResponseStatus(server::http::HttpStatus::kConflict);
+  }
+
+  return res.AsSingleRow<std::string>();
+}
+
+std::string KeyValue::DeleteValue(std::string_view key) const {
+  auto res =
+      pg_cluster_->Execute(storages::postgres::ClusterHostType::kMaster,
+                           "DELETE FROM key_value_table WHERE key=$1", key);
+  return std::to_string(res.RowsAffected());
 }
 
 }  // namespace ink

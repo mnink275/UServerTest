@@ -1,36 +1,24 @@
-#include <userver/clients/http/component.hpp>
-#include <userver/components/minimal_server_component_list.hpp>
-#include <userver/server/handlers/ping.hpp>
-#include <userver/server/handlers/tests_control.hpp>
+#include <userver/clients/dns/component.hpp>
 #include <userver/testsuite/testsuite_support.hpp>
+
+#include <userver/utest/using_namespace_userver.hpp>
+
+#include <userver/components/component.hpp>
+#include <userver/components/minimal_server_component_list.hpp>
+#include <userver/server/handlers/http_handler_base.hpp>
 #include <userver/utils/daemon_run.hpp>
 
-//#include "hello.hpp"
-#include "config_handler.hpp"
+#include <userver/storages/postgres/cluster.hpp>
+#include <userver/storages/postgres/component.hpp>
 
-using namespace userver;
-
-namespace ink {
-
-class Hello final : public server::handlers::HttpHandlerBase {
- public:
-  // `kName` is used as the component name in static config
-  static constexpr std::string_view kName = "handler-hello";
-
-  // Component is valid after construction and is able to accept requests
-  using HttpHandlerBase::HttpHandlerBase;
-
-  std::string HandleRequestThrow(
-      const server::http::HttpRequest&,
-      server::request::RequestContext&) const override {
-    return "Hello world!\n";
-  }
-};
-
-}  // namespace ink
+#include "hello.hpp"
 
 int main(int argc, char* argv[]) {
-  const auto component_list = userver::components::MinimalServerComponentList()
-                                  .Append<ink::ConfigDistributor>();
-  return userver::utils::DaemonMain(argc, argv, component_list);
+  const auto component_list =
+      components::MinimalServerComponentList()
+          .Append<ink::KeyValue>()
+          .Append<components::Postgres>("key-value-database")
+          .Append<components::TestsuiteSupport>()
+          .Append<clients::dns::Component>();
+  return utils::DaemonMain(argc, argv, component_list);
 }
